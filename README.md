@@ -191,6 +191,7 @@ streamlit run travel_agent.py
 
 *   [🗣️ AI Audio Tour Agent](voice_ai_agents/ai_audio_tour_agent/)
 *   [📞 Customer Support Voice Agent](voice_ai_agents/customer_support_voice_agent/)
+*   [🛡️ Insurance Claim Live Agent Team](voice_ai_agents/insurance_claim_live_agent_team/)
 *   [🔊 Voice RAG Agent (OpenAI SDK)](voice_ai_agents/voice_rag_openaisdk/)
 *   [🎙️ OpenSource Voice Dictation Agent (Wispr Flow clone)](https://github.com/akshayaggarwal99/jarvis-ai-assistant) <sub>↗ external</sub>
 
