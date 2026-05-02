@@ -15,8 +15,9 @@ const textForm = document.querySelector("#textForm");
 const textInput = document.querySelector("#textInput");
 const modelLabel = document.querySelector("#modelLabel");
 
-const API_ORIGIN = "http://127.0.0.1:4177";
-const WS_ORIGIN = "ws://127.0.0.1:4177";
+const DEFAULT_API_ORIGIN = "http://127.0.0.1:4177";
+const API_ORIGIN = window.location.protocol === "file:" ? DEFAULT_API_ORIGIN : window.location.origin;
+const WS_ORIGIN = API_ORIGIN.replace(/^http/, "ws");
 
 if (window.location.protocol === "file:") {
   window.location.replace(`${API_ORIGIN}/index.html`);

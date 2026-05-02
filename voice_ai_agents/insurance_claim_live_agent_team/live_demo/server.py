@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import logging
 import os
 import re
 import sys
@@ -27,6 +29,28 @@ DEMO_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+
+def _load_dotenv() -> None:
+    env_path = APP_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _cors_origins() -> list[str]:
+    raw = os.getenv("FNOL_CORS_ORIGINS", "")
+    if raw.strip():
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return ["http://127.0.0.1:4177", "http://localhost:4177"]
+
+
+_load_dotenv()
+
 from agent import (  # noqa: E402
     MODEL,
     blank_claim,
@@ -37,6 +61,7 @@ from schemas import ClaimClassification, ClaimNarrative  # noqa: E402
 
 LIVE_MODEL = os.getenv("FNOL_GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
 GENAI_CLIENT = None
+logger = logging.getLogger(__name__)
 
 
 class MessageRequest(BaseModel):
@@ -65,25 +90,10 @@ sessions: dict[str, IntakeSession] = {}
 app = FastAPI(title="Insurance Claim Live Agent Team API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-def _load_dotenv() -> None:
-    env_path = APP_DIR / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-_load_dotenv()
 
 
 def _has_api_key() -> bool:
@@ -193,7 +203,10 @@ def _positive_safety_items(items: list[str]) -> list[str]:
     return [
         item
         for item in items
-        if any(re.search(pattern, _without_negated_safety_mentions(item), flags=re.IGNORECASE) for pattern in patterns)
+        if any(
+            re.search(pattern, _without_negated_safety_mentions(item), flags=re.IGNORECASE)
+            for pattern in patterns
+        )
     ]
 
 
@@ -210,6 +223,15 @@ def _field(label: str, value: Any, source: str = "Gemini extraction", urgent: bo
         "status": status,
         "source": "-" if status == "missing" else source,
     }
+
+
+def _items_containing(items: list[str], needles: list[str], fallback: str = "Unknown") -> str:
+    matches = [
+        item
+        for item in items
+        if any(needle in item.lower() for needle in needles)
+    ]
+    return _join(matches, fallback)
 
 
 def _events(
@@ -337,7 +359,6 @@ def _ui_state(
     if not positive_safety_items and _has_negated_safety_mention(safety_text):
         injury_text = "No injuries reported"
     evidence_text = _join(claim.evidence_available, "Not captured yet")
-    docs_text = _join(claim.documents_mentioned, "Not captured yet")
     required_doc_names = [item["item"] for item in checklist.get("items", [])]
 
     fields = {
@@ -357,8 +378,24 @@ def _ui_state(
                 urgent=bool(positive_safety_items),
             )
         ),
-        "hazards": counted(_field("Hazards present", _join([item for item in claim.injuries_or_safety_concerns if "hazard" in item.lower() or "unsafe" in item.lower()], "Unknown"))),
-        "medical": counted(_field("Medical attention", _join([item for item in claim.injuries_or_safety_concerns if "medical" in item.lower() or "care" in item.lower() or "hospital" in item.lower()], "Unknown"))),
+        "hazards": counted(
+            _field(
+                "Hazards present",
+                _items_containing(
+                    claim.injuries_or_safety_concerns,
+                    ["hazard", "unsafe"],
+                ),
+            )
+        ),
+        "medical": counted(
+            _field(
+                "Medical attention",
+                _items_containing(
+                    claim.injuries_or_safety_concerns,
+                    ["medical", "care", "hospital"],
+                ),
+            )
+        ),
         "police": counted(_field("Report number", _find_report(claim))),
         "photos": counted(_field("Evidence available", evidence_text)),
         "tow": counted(_field("Tow info", _find_text(claim, ["tow", "storage"]))),
@@ -574,6 +611,12 @@ async def live_voice(websocket: WebSocket) -> None:
     )
 
     state_lock = asyncio.Lock()
+    background_tasks: set[asyncio.Task] = set()
+
+    def schedule_state_update(text: str) -> None:
+        task = asyncio.create_task(update_claim_state(text))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     async def update_claim_state(text: str) -> None:
         if not text.strip():
@@ -627,7 +670,7 @@ async def live_voice(websocket: WebSocket) -> None:
                             "reason": reason,
                         }
                     )
-                    asyncio.create_task(update_claim_state(finished))
+                    schedule_state_update(finished)
 
                 async def finalize_output(reason: str) -> None:
                     nonlocal pending_output
@@ -707,15 +750,32 @@ async def live_voice(websocket: WebSocket) -> None:
                         ):
                             await finalize_output("live_turn_complete")
 
-            await asyncio.gather(client_to_gemini(), gemini_to_client())
+            tasks = {
+                asyncio.create_task(client_to_gemini()),
+                asyncio.create_task(gemini_to_client()),
+            }
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            for task in done:
+                task.result()
     except WebSocketDisconnect:
         return
     except Exception as exc:
-        print(f"Gemini Live session failed: {type(exc).__name__}: {exc}", flush=True)
+        logger.exception("Gemini Live session failed")
         try:
             await websocket.send_json({"type": "error", "message": f"Gemini Live session failed: {exc}"})
         except Exception:
             pass
+    finally:
+        for task in list(background_tasks):
+            task.cancel()
+        for task in list(background_tasks):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 @app.get("/")

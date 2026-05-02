@@ -219,6 +219,8 @@ def create_normalizer() -> LlmAgent:
         name="NormalizeClaimNarrative",
         model=MODEL,
         description="Normalizes messy insurance claim narratives into structured intake facts.",
+        disallow_transfer_to_parent=True,
+        disallow_transfer_to_peers=True,
         instruction="""
 You are the intake specialist for an AI Insurance Claim Intake Agent.
 
@@ -252,6 +254,8 @@ def create_classifier() -> LlmAgent:
         name="ClassifyClaimTypeAndSeverity",
         model=MODEL,
         description="Classifies claim type, severity, policy line, and claimant needs.",
+        disallow_transfer_to_parent=True,
+        disallow_transfer_to_peers=True,
         instruction="""
 Classify this normalized claim for insurance intake routing.
 
@@ -340,7 +344,7 @@ async def run_claim_workflow(
 ) -> dict[str, Any]:
     """Run the ADK claim graph for the current claimant transcript snapshot."""
 
-    transcript = claimant_transcript.strip()
+    transcript = str(claimant_transcript or "").strip()
     if not transcript:
         return build_initial_workflow_state()
 
@@ -371,12 +375,15 @@ async def run_claim_workflow(
         ],
     )
 
-    async for _ in runner.run_async(
+    event_count = 0
+    async for _event in runner.run_async(
         user_id=user_id,
         session_id=adk_session_id,
         new_message=message,
     ):
-        pass
+        event_count += 1
+    if event_count == 0:
+        raise RuntimeError("ADK workflow completed without emitting any events.")
 
     session = await _await_if_needed(
         session_service.get_session(

@@ -34,8 +34,6 @@ except ImportError:
     )
 
 
-SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
-
 TYPE_REQUIRED_DOCS: dict[str, list[tuple[str, str]]] = {
     "home_water_damage": [
         ("Photos or video of damaged areas before cleanup", "Documents the loss condition."),
