@@ -67,9 +67,7 @@ insurance_claim_live_agent_team/
 |   |-- index.html
 |   |-- styles.css
 |   |-- app.js
-|   |-- server.py
-|   `-- assets/
-|       `-- fnol-live-intake-concept.png
+|   `-- server.py
 `-- README.md
 ```
 
