@@ -36,16 +36,40 @@ This is designed as a realistic first notice of loss (FNOL) workflow: the claima
 
 ## App Engine
 
-The app combines live voice, structured extraction, and deterministic insurance rules:
+The app combines live voice, an ADK graph, structured extraction, and deterministic insurance rules:
 
 | Layer | Model / Engine | Purpose |
 | --- | --- | --- |
 | Live voice | `gemini-3.1-flash-live-preview` | Voice-to-voice conversation, audio responses, and transcription |
-| Structured extraction | `gemini-3-flash-preview` | Converts messy claim language into structured claim facts |
-| Agent workflow | ADK `SequentialAgent` + function nodes | Organizes normalization, classification, validation, routing, and packet generation |
-| Business rules | Python + Pydantic | Deterministic missing-field checks, evidence gates, safety routing, SIU signals, and handoff packet output |
-| App backend | FastAPI | Serves the frontend and coordinates the model calls, WebSocket audio stream, and claim state |
+| ADK graph | `root_agent` in `agent.py` | Source of truth for claim normalization, classification, validation, routing, and packet generation |
+| Structured extraction | `gemini-3-flash-preview` | Converts messy claim language into structured claim facts inside the ADK graph |
+| Business rules | Python FunctionNodes + Pydantic | Deterministic missing-field checks, evidence gates, safety routing, SIU signals, and handoff packet output |
+| App backend | FastAPI | Serves the frontend, manages WebSocket audio, and calls `run_claim_workflow()` from `agent.py` after each claimant turn |
 | Frontend | HTML, CSS, JavaScript | Dark professional live cockpit for voice, transcript, claim state, and handoff |
+
+## How It Works
+
+`agent.py` owns the production claim workflow. It exposes the ADK `root_agent` and a `run_claim_workflow()` helper that runs the graph programmatically for the live app.
+
+`server.py` owns the live web transport. It manages the browser session, Gemini Live audio stream, transcripts, and FastAPI routes. It does not duplicate extraction, classification, evidence, routing, or packet logic.
+
+The live app flow is:
+
+```text
+Claimant speaks or types
+        |
+        v
+server.py captures the turn
+        |
+        v
+run_claim_workflow() executes root_agent
+        |
+        v
+ADK graph runs LLM nodes + deterministic FunctionNodes
+        |
+        v
+server.py renders the returned claim state in the UI
+```
 
 ## Architecture
 

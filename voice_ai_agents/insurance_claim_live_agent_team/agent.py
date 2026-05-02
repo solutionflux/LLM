@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
+import json
+import uuid
 from typing import Any, AsyncGenerator, Callable
 
 from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict
 from typing_extensions import override
 
 try:
@@ -19,7 +24,15 @@ try:
         generate_document_checklist,
         validate_required_claim_fields,
     )
-    from .schemas import ClaimClassification, ClaimNarrative
+    from .schemas import (
+        ClaimClassification,
+        ClaimIntakePacket,
+        ClaimNarrative,
+        CoverageEvidenceDecision,
+        DocumentChecklist,
+        FieldValidation,
+        FraudSafetyGate,
+    )
 except ImportError:
     from policies import (
         apply_coverage_and_evidence_rules,
@@ -28,10 +41,94 @@ except ImportError:
         generate_document_checklist,
         validate_required_claim_fields,
     )
-    from schemas import ClaimClassification, ClaimNarrative
+    from schemas import (
+        ClaimClassification,
+        ClaimIntakePacket,
+        ClaimNarrative,
+        CoverageEvidenceDecision,
+        DocumentChecklist,
+        FieldValidation,
+        FraudSafetyGate,
+    )
 
 
 MODEL = "gemini-3-flash-preview"
+APP_NAME = "insurance_claim_live_agent_team"
+
+
+async def _await_if_needed(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return value
+    return value
+
+
+def blank_claim() -> dict[str, Any]:
+    return {
+        "policyholder_name": "not specified",
+        "policy_number": "not specified",
+        "contact_method": "not specified",
+        "date_of_loss": "not specified",
+        "reported_date": "not specified",
+        "loss_location": "not specified",
+        "loss_description": "not specified",
+        "estimated_loss_usd": None,
+        "injuries_or_safety_concerns": [],
+        "parties_involved": [],
+        "evidence_available": [],
+        "documents_mentioned": [],
+        "missing_or_uncertain_facts": [],
+        "raw_narrative_summary": "not specified",
+        "assumptions": [],
+    }
+
+
+def initial_classification() -> dict[str, Any]:
+    return {
+        "claim_type": "other",
+        "severity": "medium",
+        "severity_rationale": "Waiting for claimant facts.",
+        "likely_policy_line": "unknown",
+        "loss_drivers": [],
+        "claimant_needs": ["Provide initial loss facts."],
+    }
+
+
+def build_initial_workflow_state() -> dict[str, Any]:
+    claim = blank_claim()
+    classification = initial_classification()
+    validation = validate_required_claim_fields(claim)
+    coverage = apply_coverage_and_evidence_rules(claim, validation, classification)
+    checklist = generate_document_checklist(claim, classification, coverage)
+    fraud_gate = fraud_signal_and_safety_gate(claim, validation, classification, coverage)
+    packet = build_claim_intake_packet(
+        claim,
+        validation,
+        classification,
+        coverage,
+        checklist,
+        fraud_gate,
+    )
+    return {
+        "normalized_claim": claim,
+        "field_validation": validation,
+        "claim_classification": classification,
+        "coverage_evidence_decision": coverage,
+        "document_checklist": checklist,
+        "fraud_safety_gate": fraud_gate,
+        "claim_intake_packet": packet,
+        "final_markdown": packet["markdown"],
+    }
 
 
 def _content(text: str) -> genai_types.Content:
@@ -235,4 +332,85 @@ def create_workflow() -> SequentialAgent:
 root_agent = create_workflow()
 
 
-__all__ = ["root_agent", "create_workflow"]
+async def run_claim_workflow(
+    claimant_transcript: str,
+    *,
+    session_id: str | None = None,
+    user_id: str = "live-ui",
+) -> dict[str, Any]:
+    """Run the ADK claim graph for the current claimant transcript snapshot."""
+
+    transcript = claimant_transcript.strip()
+    if not transcript:
+        return build_initial_workflow_state()
+
+    adk_session_id = f"claim-{session_id or uuid.uuid4().hex}"
+    session_service = InMemorySessionService()
+    await _await_if_needed(
+        session_service.create_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=adk_session_id,
+        )
+    )
+    runner = Runner(
+        app_name=APP_NAME,
+        agent=root_agent,
+        session_service=session_service,
+    )
+    message = genai_types.Content(
+        role="user",
+        parts=[
+            genai_types.Part(
+                text=(
+                    "Use this full claimant transcript as the source of truth for "
+                    "the insurance intake workflow. Do not invent missing facts.\n\n"
+                    f"{transcript}"
+                )
+            )
+        ],
+    )
+
+    async for _ in runner.run_async(
+        user_id=user_id,
+        session_id=adk_session_id,
+        new_message=message,
+    ):
+        pass
+
+    session = await _await_if_needed(
+        session_service.get_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=adk_session_id,
+        )
+    )
+    state = session.state
+    claim = ClaimNarrative.model_validate(_plain(state.get("normalized_claim")))
+    validation = FieldValidation.model_validate(_plain(state.get("field_validation")))
+    classification = ClaimClassification.model_validate(_plain(state.get("claim_classification")))
+    coverage = CoverageEvidenceDecision.model_validate(_plain(state.get("coverage_evidence_decision")))
+    checklist = DocumentChecklist.model_validate(_plain(state.get("document_checklist")))
+    fraud_gate = FraudSafetyGate.model_validate(_plain(state.get("fraud_safety_gate")))
+    packet = ClaimIntakePacket.model_validate(_plain(state.get("claim_intake_packet")))
+    return {
+        "normalized_claim": claim.model_dump(exclude_none=True),
+        "field_validation": validation.model_dump(exclude_none=True),
+        "claim_classification": classification.model_dump(exclude_none=True),
+        "coverage_evidence_decision": coverage.model_dump(exclude_none=True),
+        "document_checklist": checklist.model_dump(exclude_none=True),
+        "fraud_safety_gate": fraud_gate.model_dump(exclude_none=True),
+        "claim_intake_packet": packet.model_dump(exclude_none=True),
+        "final_markdown": packet.markdown,
+    }
+
+
+__all__ = [
+    "APP_NAME",
+    "MODEL",
+    "blank_claim",
+    "build_initial_workflow_state",
+    "create_workflow",
+    "run_claim_workflow",
+    "root_agent",
+]

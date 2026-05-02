@@ -1,8 +1,7 @@
 """FastAPI backend for the Insurance Claim Live Agent Team UI.
 
-The browser sends claimant turns here. This backend calls Gemini structured
-output for language-heavy extraction/classification, then runs the existing
-deterministic policy gates from policies.py.
+The browser transport lives here. Claim workflow execution lives in agent.py,
+which defines and runs the ADK graph.
 """
 
 from __future__ import annotations
@@ -21,23 +20,21 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 APP_DIR = Path(__file__).resolve().parents[1]
 DEMO_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from policies import (  # noqa: E402
-    apply_coverage_and_evidence_rules,
-    build_claim_intake_packet,
-    fraud_signal_and_safety_gate,
-    generate_document_checklist,
-    validate_required_claim_fields,
+from agent import (  # noqa: E402
+    MODEL,
+    blank_claim,
+    build_initial_workflow_state,
+    run_claim_workflow,
 )
 from schemas import ClaimClassification, ClaimNarrative  # noqa: E402
 
-MODEL = os.getenv("FNOL_GEMINI_MODEL", "gemini-3-flash-preview")
 LIVE_MODEL = os.getenv("FNOL_GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
 GENAI_CLIENT = None
 
@@ -52,15 +49,6 @@ class SessionResponse(BaseModel):
     model: str
     has_api_key: bool
     state: dict[str, Any]
-
-
-class AgentReply(BaseModel):
-    response_text: str = Field(
-        description=(
-            "Natural claimant-facing response. Ask the next needed question or "
-            "confirm the handoff status. Do not promise coverage, payment, or liability."
-        )
-    )
 
 
 @dataclass
@@ -126,55 +114,14 @@ def _client():
     return GENAI_CLIENT
 
 
-def _blank_claim() -> dict[str, Any]:
-    return {
-        "policyholder_name": "not specified",
-        "policy_number": "not specified",
-        "contact_method": "not specified",
-        "date_of_loss": "not specified",
-        "reported_date": "not specified",
-        "loss_location": "not specified",
-        "loss_description": "not specified",
-        "estimated_loss_usd": None,
-        "injuries_or_safety_concerns": [],
-        "parties_involved": [],
-        "evidence_available": [],
-        "documents_mentioned": [],
-        "missing_or_uncertain_facts": [],
-        "raw_narrative_summary": "not specified",
-        "assumptions": [],
-    }
-
-
 def _claim_from_session(session: IntakeSession) -> dict[str, Any]:
-    return session.normalized_claim or _blank_claim()
+    return session.normalized_claim or blank_claim()
 
 
 def _claimant_text(session: IntakeSession) -> str:
     return "\n".join(
         turn["text"] for turn in session.transcript if turn["speaker"] == "Claimant"
     )
-
-
-def _generate_structured(prompt: str, schema: type[BaseModel]) -> dict[str, Any]:
-    try:
-        response = _client().models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": schema.model_json_schema(),
-            },
-        )
-        return schema.model_validate_json(response.text).model_dump(exclude_none=True)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini request failed: {exc}") from exc
-
-
-async def _generate_structured_async(prompt: str, schema: type[BaseModel]) -> dict[str, Any]:
-    return await asyncio.to_thread(_generate_structured, prompt, schema)
 
 
 def _transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
@@ -206,48 +153,6 @@ def _transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
     if not text:
         raise HTTPException(status_code=422, detail="No speech was transcribed from the audio.")
     return text
-
-
-def _normalize_claim(session: IntakeSession) -> dict[str, Any]:
-    current = _claim_from_session(session)
-    prompt = f"""
-You are an insurance FNOL intake extraction service.
-
-Use the full claimant transcript to produce one complete ClaimNarrative.
-Preserve known facts from the current claim state unless the transcript corrects them.
-Do not invent policy numbers, contacts, dates, locations, evidence, or dollar amounts.
-Use "not specified" for unknown string fields.
-
-Current claim state:
-{current}
-
-Claimant transcript:
-{_claimant_text(session)}
-"""
-    return _generate_structured(prompt, ClaimNarrative)
-
-
-def _classify_claim(
-    claim: dict[str, Any],
-    validation: dict[str, Any],
-) -> dict[str, Any]:
-    prompt = f"""
-Classify this insurance FNOL intake for operational routing.
-Return a ClaimClassification only. Do not decide coverage or payment.
-
-Normalized claim:
-{claim}
-
-Field validation:
-{validation}
-
-Severity rubric:
-- low: complete, low-dollar, no injury/safety issue, routine documentation.
-- medium: missing documents or moderate complexity.
-- high: high estimated loss, unclear liability, missing core facts, or specialized handling likely.
-- urgent: injury, unsafe living condition, emergency medical/safety concern, or time-sensitive mitigation.
-"""
-    return _generate_structured(prompt, ClaimClassification)
 
 
 def _status(value: Any, urgent: bool = False) -> str:
@@ -399,60 +304,6 @@ def _next_question(
     return "I have enough for the initial intake packet. Is there anything important the adjuster should know before handoff?"
 
 
-def _agent_reply(
-    session: IntakeSession,
-    validation: dict[str, Any],
-    coverage: dict[str, Any],
-    checklist: dict[str, Any],
-    fraud_gate: dict[str, Any],
-    packet: dict[str, Any],
-) -> str:
-    next_action = _next_question(validation, coverage, fraud_gate)
-    route = fraud_gate.get("final_routing_decision", coverage.get("routing_decision"))
-    prompt = f"""
-You are the voice/text insurance FNOL intake agent speaking directly to the claimant.
-
-Generate the next response for the claimant based on the latest turn, structured claim state,
-deterministic rules, and next best action. Keep it concise, empathetic, and operational.
-
-Hard constraints:
-- Do not promise coverage, payment, liability, benefits, or claim approval.
-- If injury, unsafe living condition, or immediate danger is present, prioritize safety and human review.
-- Ask only one or two focused follow-up questions.
-- Acknowledge facts already captured without repeating the full packet.
-- Do not reveal hidden reasoning. You may reference that the intake packet was updated.
-
-Transcript:
-{session.transcript}
-
-Normalized claim:
-{session.normalized_claim}
-
-Validation:
-{validation}
-
-Coverage/evidence rules:
-{coverage}
-
-Checklist:
-{checklist}
-
-Fraud/safety gate:
-{fraud_gate}
-
-Current routing decision:
-{route}
-
-Next best action:
-{next_action}
-
-Current handoff packet summary:
-{packet.get("adjuster_handoff_summary")}
-"""
-    reply = _generate_structured(prompt, AgentReply)
-    return reply["response_text"]
-
-
 def _ui_state(
     session: IntakeSession,
     validation: dict[str, Any],
@@ -551,100 +402,32 @@ def _find_report(claim: ClaimNarrative) -> str:
     return "not specified"
 
 
-def _process(session: IntakeSession) -> dict[str, Any]:
-    session.normalized_claim = _normalize_claim(session)
-    validation = validate_required_claim_fields(session.normalized_claim)
-    session.classification = _classify_claim(session.normalized_claim, validation)
-    coverage = apply_coverage_and_evidence_rules(
-        session.normalized_claim,
-        validation,
-        session.classification,
-    )
-    checklist = generate_document_checklist(
-        session.normalized_claim,
-        session.classification,
-        coverage,
-    )
-    fraud_gate = fraud_signal_and_safety_gate(
-        session.normalized_claim,
-        validation,
-        session.classification,
-        coverage,
-    )
+def _state_from_workflow(session: IntakeSession, workflow: dict[str, Any]) -> dict[str, Any]:
+    validation = workflow["field_validation"]
+    coverage = workflow["coverage_evidence_decision"]
+    checklist = workflow["document_checklist"]
+    fraud_gate = workflow["fraud_safety_gate"]
+    packet = workflow["claim_intake_packet"]
+    session.normalized_claim = workflow["normalized_claim"]
+    session.classification = workflow["claim_classification"]
     events = _events(session, validation, coverage, fraud_gate)
     session.route = fraud_gate["final_routing_decision"]
-    packet = build_claim_intake_packet(
-        session.normalized_claim,
-        validation,
-        session.classification,
-        coverage,
-        checklist,
-        fraud_gate,
-    )
-    reply = _agent_reply(session, validation, coverage, checklist, fraud_gate, packet)
-    session.transcript.append({"speaker": "Agent", "text": reply})
     return _ui_state(session, validation, coverage, checklist, fraud_gate, packet, events)
 
 
-async def _process_live_state(session: IntakeSession) -> dict[str, Any]:
-    session.normalized_claim = await _generate_structured_async(
-        f"""
-You are an insurance FNOL intake extraction service.
-
-Use the full claimant transcript to produce one complete ClaimNarrative.
-Preserve known facts from the current claim state unless the transcript corrects them.
-Do not invent policy numbers, contacts, dates, locations, evidence, or dollar amounts.
-Use "not specified" for unknown string fields.
-
-Current claim state:
-{_claim_from_session(session)}
-
-Claimant transcript:
-{_claimant_text(session)}
-""",
-        ClaimNarrative,
+async def _process_with_adk_graph(
+    session: IntakeSession,
+    *,
+    add_claimant_facing_reply: bool,
+) -> dict[str, Any]:
+    workflow = await run_claim_workflow(
+        _claimant_text(session),
+        session_id=session.session_id,
     )
-    validation = validate_required_claim_fields(session.normalized_claim)
-    session.classification = await _generate_structured_async(
-        f"""
-Classify this insurance FNOL intake for operational routing.
-Return a ClaimClassification only. Do not decide coverage or payment.
-
-Normalized claim:
-{session.normalized_claim}
-
-Field validation:
-{validation}
-""",
-        ClaimClassification,
-    )
-    coverage = apply_coverage_and_evidence_rules(
-        session.normalized_claim,
-        validation,
-        session.classification,
-    )
-    checklist = generate_document_checklist(
-        session.normalized_claim,
-        session.classification,
-        coverage,
-    )
-    fraud_gate = fraud_signal_and_safety_gate(
-        session.normalized_claim,
-        validation,
-        session.classification,
-        coverage,
-    )
-    events = _events(session, validation, coverage, fraud_gate)
-    session.route = fraud_gate["final_routing_decision"]
-    packet = build_claim_intake_packet(
-        session.normalized_claim,
-        validation,
-        session.classification,
-        coverage,
-        checklist,
-        fraud_gate,
-    )
-    return _ui_state(session, validation, coverage, checklist, fraud_gate, packet, events)
+    if add_claimant_facing_reply:
+        packet = workflow["claim_intake_packet"]
+        session.transcript.append({"speaker": "Agent", "text": packet["claimant_next_message"]})
+    return _state_from_workflow(session, workflow)
 
 
 @app.get("/api/health")
@@ -662,42 +445,22 @@ def create_session() -> SessionResponse:
         }
     )
     sessions[session.session_id] = session
-    validation = validate_required_claim_fields(_blank_claim())
-    classification = {
-        "claim_type": "other",
-        "severity": "medium",
-        "severity_rationale": "Waiting for claimant facts.",
-        "likely_policy_line": "unknown",
-        "loss_drivers": [],
-        "claimant_needs": ["Provide initial loss facts."],
-    }
-    session.normalized_claim = _blank_claim()
-    session.classification = classification
-    coverage = apply_coverage_and_evidence_rules(session.normalized_claim, validation, classification)
-    checklist = generate_document_checklist(session.normalized_claim, classification, coverage)
-    fraud_gate = fraud_signal_and_safety_gate(
-        session.normalized_claim, validation, classification, coverage
-    )
-    packet = build_claim_intake_packet(
-        session.normalized_claim,
-        validation,
-        classification,
-        coverage,
-        checklist,
-        fraud_gate,
-    )
+    workflow = build_initial_workflow_state()
+    session.normalized_claim = workflow["normalized_claim"]
+    session.classification = workflow["claim_classification"]
+    session.route = workflow["fraud_safety_gate"]["final_routing_decision"]
     state = _ui_state(
         session,
-        validation,
-        coverage,
-        checklist,
-        fraud_gate,
-        packet,
+        workflow["field_validation"],
+        workflow["coverage_evidence_decision"],
+        workflow["document_checklist"],
+        workflow["fraud_safety_gate"],
+        workflow["claim_intake_packet"],
         [
             {
                 "tone": "warning",
                 "title": "Waiting for claimant facts",
-                "detail": "The backend session is open and ready for Gemini extraction.",
+                "detail": "The ADK graph is ready to process claimant facts.",
                 "rule": "SESSION-001",
             }
         ],
@@ -711,7 +474,7 @@ def create_session() -> SessionResponse:
 
 
 @app.post("/api/message", response_model=SessionResponse)
-def message(request: MessageRequest) -> SessionResponse:
+async def message(request: MessageRequest) -> SessionResponse:
     session = sessions.get(request.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Unknown intake session.")
@@ -719,7 +482,7 @@ def message(request: MessageRequest) -> SessionResponse:
     if not text:
         raise HTTPException(status_code=400, detail="Message text is required.")
     session.transcript.append({"speaker": "Claimant", "text": text})
-    state = _process(session)
+    state = await _process_with_adk_graph(session, add_claimant_facing_reply=True)
     return SessionResponse(
         session_id=session.session_id,
         model=MODEL,
@@ -742,7 +505,7 @@ async def audio_message(
     mime_type = audio.content_type or "audio/webm"
     text = _transcribe_audio(audio_bytes, mime_type)
     session.transcript.append({"speaker": "Claimant", "text": text})
-    state = _process(session)
+    state = await _process_with_adk_graph(session, add_claimant_facing_reply=True)
     return SessionResponse(
         session_id=session.session_id,
         model=MODEL,
@@ -818,7 +581,7 @@ async def live_voice(websocket: WebSocket) -> None:
         async with state_lock:
             session.transcript.append({"speaker": "Claimant", "text": text.strip()})
             try:
-                state = await _process_live_state(session)
+                state = await _process_with_adk_graph(session, add_claimant_facing_reply=False)
                 await websocket.send_json({"type": "state", "state": state})
             except Exception as exc:
                 await websocket.send_json({"type": "error", "message": f"Claim state update failed: {exc}"})
@@ -839,7 +602,7 @@ async def live_voice(websocket: WebSocket) -> None:
                         if text:
                             session.transcript.append({"speaker": "Claimant", "text": text})
                             await live_session.send(input=text, end_of_turn=True)
-                            state = await _process_live_state(session)
+                            state = await _process_with_adk_graph(session, add_claimant_facing_reply=False)
                             await websocket.send_json({"type": "state", "state": state})
                     elif msg_type == "close":
                         await websocket.close()
