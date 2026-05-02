@@ -109,8 +109,7 @@ h3 {
 }
 
 .live-model,
-.status-line,
-.state-pill {
+.status-line {
   color: var(--muted);
   font-size: 13px;
   display: inline-flex;
@@ -135,7 +134,6 @@ h3 {
   background: var(--muted-soft);
 }
 
-.route-pill,
 .status-pill {
   border-radius: 999px;
   font-size: 12px;
@@ -143,54 +141,6 @@ h3 {
   padding: 8px 12px;
   text-transform: uppercase;
   letter-spacing: 0;
-}
-
-.operator {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.headset {
-  width: 22px;
-  height: 22px;
-  border: 2px solid var(--body);
-  border-bottom: 0;
-  border-radius: 14px 14px 4px 4px;
-  position: relative;
-  opacity: 0.9;
-}
-
-.headset::before,
-.headset::after {
-  content: "";
-  position: absolute;
-  top: 10px;
-  width: 5px;
-  height: 9px;
-  background: var(--body);
-  border-radius: 3px;
-}
-
-.headset::before {
-  left: -4px;
-}
-
-.headset::after {
-  right: -4px;
-}
-
-.avatar {
-  width: 34px;
-  height: 34px;
-  display: grid;
-  place-items: center;
-  border-radius: 50%;
-  background: var(--panel-strong);
-  border: 1px solid var(--hairline-strong);
-  color: var(--ink);
-  font-size: 12px;
-  font-weight: 700;
 }
 
 .dashboard {
@@ -473,13 +423,6 @@ h3 {
   font-size: 14px;
   line-height: 1.48;
   overflow-wrap: anywhere;
-}
-
-.highlight {
-  color: var(--danger);
-  background: var(--danger-bg);
-  border-radius: 4px;
-  padding: 1px 3px;
 }
 
 .text-entry {

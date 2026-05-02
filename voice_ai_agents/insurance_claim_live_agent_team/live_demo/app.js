@@ -4,8 +4,6 @@ const timelineEl = document.querySelector("#timeline");
 const handoffEl = document.querySelector("#handoff");
 const packetMarkdownEl = document.querySelector("#packetMarkdown");
 const packetDialog = document.querySelector("#packetDialog");
-const routePill = document.querySelector("#routePill");
-const claimState = document.querySelector("#claimState");
 const packetProgress = document.querySelector("#packetProgress");
 const callStatus = document.querySelector("#callStatus");
 const micButton = document.querySelector("#micButton");
@@ -97,21 +95,19 @@ function render() {
   renderFields();
   renderTimeline();
   renderHandoff();
-  renderRoute();
   renderPacket();
 }
 
 function renderTranscript() {
   transcriptEl.innerHTML = state.transcript
     .map((turn) => {
-      const safeText = escapeHtml(turn.text).replace(/passenger has neck pain/gi, '<span class="highlight">$&</span>');
       const initials = turn.speaker === "Agent" ? "AI" : "CL";
       return `
         <article class="turn ${turn.speaker === "Agent" ? "agent" : "claimant"}">
           <div class="speaker-icon">${initials}</div>
           <div class="bubble">
             <strong>${escapeHtml(turn.speaker)}</strong><time>${escapeHtml(turn.time || now())}</time>
-            <p>${safeText}</p>
+            <p>${escapeHtml(turn.text)}</p>
           </div>
         </article>
       `;
@@ -238,17 +234,6 @@ function renderHandoff() {
     .map(([label, value]) => `<div class="handoff-row"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`)
     .join("");
   packetProgress.textContent = `${state.progress}%`;
-}
-
-function renderRoute() {
-  if (!routePill || !claimState) return;
-  const route = state.route || "needs_docs";
-  routePill.className = "route-pill";
-  if (route === "emergency_escalation") routePill.classList.add("emergency");
-  if (route === "needs_docs" || route === "special_investigation") routePill.classList.add("docs");
-  if (route === "ready_for_adjuster") routePill.classList.add("ready");
-  routePill.textContent = routeLabels[route] || route;
-  claimState.textContent = `Claim state: ${(routeLabels[route] || route).toLowerCase()}`;
 }
 
 function renderPacket() {

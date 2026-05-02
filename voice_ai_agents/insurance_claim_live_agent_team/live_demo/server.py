@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -132,37 +132,6 @@ def _claimant_text(session: IntakeSession) -> str:
     return "\n".join(
         turn["text"] for turn in session.transcript if turn["speaker"] == "Claimant"
     )
-
-
-def _transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
-    try:
-        from google.genai import types
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Missing google-genai package. Run pip install -r requirements.txt.",
-        ) from exc
-
-    try:
-        response = _client().models.generate_content(
-            model=MODEL,
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                (
-                    "Transcribe this claimant audio as plain text only. "
-                    "Preserve names, phone numbers, policy numbers, locations, dates, "
-                    "injuries, documents, and evidence exactly when audible."
-                ),
-            ],
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini audio transcription failed: {exc}") from exc
-    text = (response.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="No speech was transcribed from the audio.")
-    return text
 
 
 def _status(value: Any, urgent: bool = False) -> str:
@@ -518,29 +487,6 @@ async def message(request: MessageRequest) -> SessionResponse:
     text = request.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Message text is required.")
-    session.transcript.append({"speaker": "Claimant", "text": text})
-    state = await _process_with_adk_graph(session, add_claimant_facing_reply=True)
-    return SessionResponse(
-        session_id=session.session_id,
-        model=MODEL,
-        has_api_key=_has_api_key(),
-        state=state,
-    )
-
-
-@app.post("/api/audio", response_model=SessionResponse)
-async def audio_message(
-    session_id: str = Form(...),
-    audio: UploadFile = File(...),
-) -> SessionResponse:
-    session = sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Unknown intake session.")
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Audio file is empty.")
-    mime_type = audio.content_type or "audio/webm"
-    text = _transcribe_audio(audio_bytes, mime_type)
     session.transcript.append({"speaker": "Claimant", "text": text})
     state = await _process_with_adk_graph(session, add_claimant_facing_reply=True)
     return SessionResponse(
