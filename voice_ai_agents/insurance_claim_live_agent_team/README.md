@@ -4,6 +4,8 @@ A voice-first insurance claim intake app that lets a claimant talk naturally whi
 
 This is designed as a realistic first notice of loss (FNOL) workflow: the claimant does not need to fill out a rigid form, and the operator does not need to manually translate a messy conversation into claim fields.
 
+![Insurance Claim Live Agent Team architecture](assets/insurance-claim-live-agent-team-architecture.png)
+
 ## Features
 
 ### Voice + Text Claim Intake
@@ -70,10 +72,6 @@ ADK graph runs LLM nodes + deterministic FunctionNodes
         v
 server.py renders the returned claim state in the UI
 ```
-
-## Architecture
-
-![Insurance Claim Live Agent Team architecture](assets/insurance-claim-live-agent-team-architecture.png)
 
 ## Project Structure
 
