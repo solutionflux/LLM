@@ -218,6 +218,7 @@ streamlit run travel_agent.py
 *   [👀 Hybrid Search RAG (Cloud)](rag_tutorials/hybrid_search_rag/)
 *   [🔄 Llama 3.1 Local RAG](rag_tutorials/llama3.1_local_rag/)
 *   [🖥️ Local Hybrid Search RAG](rag_tutorials/local_hybrid_search_rag/)
+*   [🧬 Multimodal Agentic RAG](rag_tutorials/multimodal_agentic_rag/)
 *   [🦙 Local RAG Agent](rag_tutorials/local_rag_agent/)
 *   [🧩 RAG-as-a-Service](rag_tutorials/rag-as-a-service/)
 *   [✨ RAG Agent with Cohere](rag_tutorials/rag_agent_cohere/)
